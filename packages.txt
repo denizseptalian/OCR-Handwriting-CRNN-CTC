@@ -1,3 +1,0 @@
-git rm packages.txt
-git commit -m "hapus packages.txt (bikin apt error di base image baru)"
-git push
