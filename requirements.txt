@@ -1,0 +1,14 @@
+# ============================================================
+# Pembaca Patok Blok/TPH - dependensi Streamlit Cloud
+# Python yang dipakai Streamlit Cloud: pilih 3.11 / 3.12
+# ============================================================
+
+streamlit>=1.36,<2
+numpy>=1.26,<2.3
+opencv-python-headless>=4.9,<5
+Pillow>=10,<12
+gTTS>=2.5,<3
+
+# Interpreter TFLite ringan (pengganti resmi tflite-runtime).
+# Jauh lebih kecil daripada tensorflow penuh -> deploy cepat.
+ai-edge-litert>=1.0
