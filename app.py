@@ -523,6 +523,125 @@ def baca_patok(bgr, block_size=41, c_thresh=15, min_h_ratio=0.05,
 
 
 # ============================================================
+# MODE "ALA GOOGLE LENS" — deteksi area teks di mana pun dalam foto,
+# sorot semi-transparan, pengguna memilih area mana dibaca sebagai apa
+# ============================================================
+def deteksi_area_teks(binary, min_h_ratio=0.03):
+    """Temukan kelompok teks (kata/baris) di seluruh foto tanpa
+    bergantung pada garis pemisah. Return daftar box (x, y, w, h)."""
+    H, W = binary.shape
+    n_lbl, lbl, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    char_mask = np.zeros_like(binary)
+    widths = []
+    for i in range(1, n_lbl):
+        x, y, w, hh, area = stats[i]
+        if hh < min_h_ratio * H or hh > 0.6 * H:
+            continue
+        density = area / max(w * hh, 1)
+        if density < 0.06 or density > 0.95:
+            continue
+        if w > 0.9 * W:            # garis horizontal panjang, bukan karakter
+            continue
+        char_mask[lbl == i] = 255
+        widths.append(w)
+    if not widths:
+        return []
+    # Gabungkan karakter berdekatan jadi satu "kata" (dilasi horizontal)
+    kw = max(9, int(np.median(widths) * 1.2)) | 1
+    word_mask = cv2.dilate(char_mask,
+                           cv2.getStructuringElement(cv2.MORPH_RECT, (kw, 3)))
+    cnts, _ = cv2.findContours(word_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = []
+    for c in cnts:
+        x, y, w, hh = cv2.boundingRect(c)
+        if hh < min_h_ratio * H or w * hh < 0.0015 * H * W:
+            continue
+        # Buang box raksasa (tekstur kulit batang yang menyatu), bukan teks
+        if w * hh > 0.30 * H * W or hh > 0.5 * H or w > 0.95 * W:
+            continue
+        if not (0.3 <= w / max(hh, 1) <= 8):     # aspek tak wajar utk 1-4 karakter
+            continue
+        # Harus berisi 1-6 komponen setinggi karakter (bukan gerombolan noise)
+        sub = char_mask[y:y + hh, x:x + w]
+        n_sub, _, stats_sub, _ = cv2.connectedComponentsWithStats(sub, connectivity=8)
+        n_char = sum(1 for k in range(1, n_sub) if stats_sub[k][3] > 0.45 * hh)
+        if not (1 <= n_char <= 6):
+            continue
+        boxes.append((x, y, w, hh))
+    boxes.sort(key=lambda b: (b[1], b[0]))   # urut atas->bawah, kiri->kanan
+    return boxes
+
+
+def baca_area(binary, box, pola="bebas"):
+    """Baca satu area teks. pola: 'blok' (huruf lalu angka),
+    'tph' (angka semua), 'bebas' (tanpa constraint)."""
+    x, y, w, hh = box
+    crop = binary[y:y + hh, x:x + w]
+    cnts, _ = cv2.findContours(crop, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cboxes = [list(cv2.boundingRect(c)) for c in cnts]
+    cboxes = [b for b in cboxes if b[3] > 0.45 * hh]
+    if not cboxes:
+        return "", []
+    # Gabung fragmen huruf pecah (versi ringkas)
+    merged = True
+    while merged:
+        merged = False
+        for i in range(len(cboxes)):
+            for j in range(i + 1, len(cboxes)):
+                a, b = cboxes[i], cboxes[j]
+                if x_overlap_ratio(a, b) > 0.4 and y_gap(a, b) < 0.4 * max(a[3], b[3]):
+                    x0 = min(a[0], b[0]); y0 = min(a[1], b[1])
+                    x1 = max(a[0] + a[2], b[0] + b[2])
+                    y1 = max(a[1] + a[3], b[1] + b[3])
+                    cboxes[i] = [x0, y0, x1 - x0, y1 - y0]
+                    cboxes.pop(j)
+                    merged = True
+                    break
+            if merged:
+                break
+    # Pisah karakter menempel, urut kiri->kanan
+    final = []
+    for (cx, cy, cw, ch) in cboxes:
+        for (sx, sy, sw, sh) in split_touching(crop[cy:cy + ch, cx:cx + cw]):
+            final.append((cx + sx, cy + sy, sw, sh))
+    final.sort(key=lambda b: b[0])
+    preds = []
+    for i, (cx, cy, cw, ch) in enumerate(final):
+        if pola == "tph":
+            allowed = DIGIT_IDX
+        elif pola == "blok":
+            allowed = LETTER_IDX if i == 0 else DIGIT_IDX
+        else:
+            allowed = None
+        preds.append(predict_char(to_model_input(crop[cy:cy + ch, cx:cx + cw]),
+                                  allowed_idx=allowed))
+    return "".join(p[0] for p in preds), preds
+
+
+def sorot_area(rgb, boxes, teks_per_area=None):
+    """Gambar sorotan semi-transparan gaya Google Lens di tiap area."""
+    vis = rgb.copy()
+    overlay = vis.copy()
+    for (x, y, w, hh) in boxes:
+        pad = max(3, hh // 10)
+        cv2.rectangle(overlay, (x - pad, y - pad), (x + w + pad, y + hh + pad),
+                      (255, 255, 255), -1)
+    vis = cv2.addWeighted(overlay, 0.40, vis, 0.60, 0)
+    tebal = max(2, rgb.shape[1] // 300)
+    for idx, (x, y, w, hh) in enumerate(boxes):
+        pad = max(3, hh // 10)
+        cv2.rectangle(vis, (x - pad, y - pad), (x + w + pad, y + hh + pad),
+                      (59, 130, 246), tebal)
+        label = f"{idx + 1}"
+        if teks_per_area and teks_per_area[idx]:
+            label += f": {teks_per_area[idx]}"
+        cv2.putText(vis, label, (x, max(y - pad - 6, 24)),
+                    cv2.FONT_HERSHEY_SIMPLEX, max(0.7, rgb.shape[1] / 700),
+                    (59, 130, 246), tebal)
+    return vis
+
+
+# ============================================================
 # TTS — suara Bahasa Indonesia
 # ============================================================
 def eja(teks):
@@ -545,6 +664,10 @@ st.title("🌴 Pembaca Patok Blok / TPH")
 
 # Pengaturan disembunyikan dalam expander (hemat layar HP)
 with st.expander("⚙️ Pengaturan"):
+    mode_lens = st.toggle("🔍 Mode pilih area (ala Google Lens)", value=False,
+                          help="Deteksi semua area teks di foto, lalu pilih sendiri "
+                               "area mana yang dibaca sebagai Blok/TPH. "
+                               "Tidak bergantung pada garis pemisah/framing.")
     suara_aktif = st.toggle("🔊 Bacakan hasil lewat suara", value=True)
     hapus_bg = st.toggle("🧹 Hapus background sebelum diproses model", value=True)
     fokus_otomatis = st.toggle("🎯 Fokus otomatis ke area patok", value=True)
@@ -582,7 +705,8 @@ pil_img = Image.open(img_file).convert("RGB")
 bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
 
 # Foto dari kamera: crop tengah 4:5 (samakan dengan preview),
-# lalu crop lagi ke KOTAK PANDUAN putus-putus — hanya area itu yang diproses
+# lalu crop lagi ke KOTAK PANDUAN putus-putus — hanya area itu yang diproses.
+# Di MODE LENS: kotak panduan dilewati (seluruh foto dipindai).
 if dari_kamera:
     Hf, Wf = bgr.shape[:2]
     target = 4 / 5  # lebar : tinggi
@@ -595,12 +719,113 @@ if dari_kamera:
         y0 = (Hf - new_h) // 2
         bgr = bgr[y0:y0 + new_h, :]
 
-    # Kotak panduan (harus sama dengan CSS ::after): top 8%, kiri/kanan 12%, bottom 22%
-    Hf, Wf = bgr.shape[:2]
-    bgr = bgr[int(0.08 * Hf):int((1 - 0.22) * Hf),
-              int(0.12 * Wf):int((1 - 0.12) * Wf)]
+    if not mode_lens:
+        # Kotak panduan (harus sama dengan CSS ::after): top 8%, kiri/kanan 12%, bottom 22%
+        Hf, Wf = bgr.shape[:2]
+        bgr = bgr[int(0.08 * Hf):int((1 - 0.22) * Hf),
+                  int(0.12 * Wf):int((1 - 0.12) * Wf)]
 
-# Proses
+# ============================================================
+# MODE LENS: deteksi semua area teks -> sorot -> pengguna memilih
+# ============================================================
+if mode_lens:
+    with st.spinner("Mencari area teks..."):
+        rgb_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        gray_full = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        if hapus_bg:
+            k = max(31, (min(gray_full.shape) // 10) | 1)
+            bgf = cv2.medianBlur(gray_full, min(k, 99))
+            gray_full = cv2.divide(gray_full, bgf, scale=255)
+            gray_full = cv2.normalize(gray_full, None, 0, 255,
+                                      cv2.NORM_MINMAX).astype(np.uint8)
+        binary_full = binarize_full(gray_full, block_size=block_size, c_thresh=c_thresh)
+        area_boxes = deteksi_area_teks(binary_full, min_h_ratio=max(0.02, min_h * 0.6))
+
+    if not area_boxes:
+        st.error("Tidak ada area teks terdeteksi. Coba foto lebih dekat, "
+                 "atau sesuaikan parameter di ⚙️ Pengaturan.")
+        st.stop()
+
+    # Baca bebas semua area dulu (untuk label sorotan, seperti Lens)
+    teks_bebas = []
+    for b in area_boxes:
+        t, _ = baca_area(binary_full, b, pola="bebas")
+        teks_bebas.append(t)
+
+    st.image(sorot_area(rgb_full, area_boxes, teks_bebas),
+             caption="Area teks terdeteksi — angka biru = nomor area",
+             use_container_width=True)
+
+    # Tebakan awal: area pertama yang mengandung huruf -> Blok;
+    # area angka-semua pertama setelahnya -> TPH
+    opsi = ["(tidak dipakai)"] + [f"Area {i+1}: «{t or '?'}»"
+                                  for i, t in enumerate(teks_bebas)]
+    guess_blok, guess_tph = 0, 0
+    for i, t in enumerate(teks_bebas):
+        if t and any(c.isalpha() for c in t) and guess_blok == 0:
+            guess_blok = i + 1
+        elif t and t.isdigit() and guess_tph == 0 and (guess_blok == 0 or i + 1 > guess_blok):
+            guess_tph = i + 1
+    if guess_blok == 0 and len(area_boxes) >= 1:
+        guess_blok = 1
+    if guess_tph == 0 and len(area_boxes) >= 2:
+        guess_tph = 2
+
+    kol1, kol2 = st.columns(2)
+    with kol1:
+        pilih_blok = st.selectbox("Baca sebagai NOMOR BLOK", opsi, index=guess_blok)
+    with kol2:
+        pilih_tph = st.selectbox("Baca sebagai NOMOR TPH", opsi, index=guess_tph)
+
+    nomor_blok, blok_preds = "", []
+    nomor_tph, tph_preds = "", []
+    if pilih_blok != "(tidak dipakai)":
+        idx = opsi.index(pilih_blok) - 1
+        nomor_blok, blok_preds = baca_area(binary_full, area_boxes[idx], pola="blok")
+    if pilih_tph != "(tidak dipakai)":
+        idx = opsi.index(pilih_tph) - 1
+        nomor_tph, tph_preds = baca_area(binary_full, area_boxes[idx], pola="tph")
+
+    if nomor_blok or nomor_tph:
+        st.markdown(f"""
+        <div class="hasil-card hasil-blok">
+            <div class="hasil-label">Nomor Blok</div>
+            <div class="hasil-nilai">{nomor_blok or '—'}</div>
+        </div>
+        <div class="hasil-card hasil-tph">
+            <div class="hasil-label">Nomor TPH</div>
+            <div class="hasil-nilai">{nomor_tph or '—'}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if suara_aktif:
+            bagian = []
+            if nomor_blok:
+                bagian.append(f"Nomor Blok, {eja(nomor_blok)}")
+            if nomor_tph:
+                bagian.append(f"Nomor T P H, {eja(nomor_tph)}")
+            try:
+                audio_bytes = buat_audio("Terdeteksi. " + ". ".join(bagian))
+                st.audio(audio_bytes, format="audio/mp3", autoplay=True)
+            except Exception:
+                st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+
+        with st.expander("📊 Detail confidence per karakter"):
+            for ch, cf, top3 in blok_preds:
+                alt = ", ".join(f"{c} {p*100:.0f}%" for c, p in top3)
+                st.write(f"Blok — **{ch}** : {cf*100:.0f}%  \n_alternatif: {alt}_")
+            for ch, cf, top3 in tph_preds:
+                alt = ", ".join(f"{c} {p*100:.0f}%" for c, p in top3)
+                st.write(f"TPH — **{ch}** : {cf*100:.0f}%  \n_alternatif: {alt}_")
+    else:
+        st.info("Pilih area di atas untuk dibaca sebagai Blok / TPH.")
+
+    if tampil_biner:
+        st.image(binary_full, caption="Gambar biner (debug)",
+                 use_container_width=True, clamp=True)
+    st.stop()
+
+# Proses (MODE OTOMATIS — garis pemisah)
 with st.spinner("Memproses..."):
     hasil = baca_patok(bgr, block_size=block_size, c_thresh=c_thresh, min_h_ratio=min_h,
                        hapus_bg=hapus_bg, hilangkan_noise=hilangkan_noise,
