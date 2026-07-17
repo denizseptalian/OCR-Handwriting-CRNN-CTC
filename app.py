@@ -14,6 +14,8 @@
 import io
 import os
 import re
+import time
+import threading
 
 import cv2
 import numpy as np
@@ -30,6 +32,15 @@ except ImportError:
     except ImportError:
         import tensorflow as tf
         Interpreter = tf.lite.Interpreter
+
+# --- streamlit-webrtc: untuk LIVE scan QR Code (tanpa perlu tekan tombol foto) ---
+# Kalau belum ter-install, menu Scan QR otomatis fallback ke mode foto biasa.
+try:
+    import av
+    from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+    _WEBRTC_TERSEDIA = True
+except ImportError:
+    _WEBRTC_TERSEDIA = False
 
 # ============================================================
 # Konfigurasi
@@ -116,6 +127,16 @@ h1 { font-size: 1.5rem !important; }
 [data-testid="stCameraInput"] button {
     min-height: 3.2rem; font-size: 1.15rem; border-radius: 12px;
 }
+
+/* Kamera LIVE (streamlit-webrtc) untuk Scan QR Code: dibuat sebesar/sepenuh
+   mungkin, tidak dibatasi kotak/aspect-ratio kecil seperti kamera OCR patok */
+[data-testid="stCameraInput"] ~ div iframe,
+iframe[title*="webrtc"], iframe[title*="streamlit_webrtc"] {
+    width: 100% !important;
+    min-height: 70vh !important;
+    border-radius: 12px;
+}
+.block-container { max-width: 100% !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -705,6 +726,52 @@ KALIMAT_LANJUT_BUAH = ("Silakan lanjutkan, arahkan kamera ke buah sawit "
                        "untuk pemindaian berikutnya.")
 
 
+# ============================================================
+# LIVE SCAN QR CODE — pakai streamlit-webrtc (kamera menyala terus,
+# QR langsung terbaca otomatis begitu terdeteksi, tanpa tekan tombol foto)
+# ============================================================
+if _WEBRTC_TERSEDIA:
+    RTC_CONFIGURATION = RTCConfiguration(
+        {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+    )
+
+    class QRVideoProcessor(VideoProcessorBase):
+        """Proses tiap frame video: cari & decode QR Code secara live.
+        Hasil disimpan di atribut (dengan lock) supaya bisa dibaca thread
+        utama Streamlit untuk ditampilkan + dibacakan suaranya."""
+
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.hasil_qr = None       # dict {afdeling, blok, tph} kalau ketemu
+            self.teks_mentah = None    # payload QR mentah (utk cek duplikat)
+            self._hitung_frame = 0
+
+        def recv(self, frame):
+            img = frame.to_ndarray(format="bgr24")
+
+            # Proses tiap 3 frame saja (hemat beban server), sisanya cukup
+            # tampilkan overlay dari hasil terakhir yang sudah didapat
+            self._hitung_frame += 1
+            if self._hitung_frame % 3 == 0:
+                teks = baca_qr(img)
+                data = urai_payload_qr(teks)
+                with self.lock:
+                    self.teks_mentah = teks
+                    self.hasil_qr = data
+            else:
+                with self.lock:
+                    data = self.hasil_qr
+
+            # Overlay penanda visual kalau QR sudah terbaca & valid
+            if data:
+                label = f"QR TERBACA - AFD{data['afdeling']} BLOK{data['blok']} TPH{data['tph']}"
+                cv2.rectangle(img, (0, 0), (img.shape[1], 50), (0, 150, 0), -1)
+                cv2.putText(img, label, (12, 34), cv2.FONT_HERSHEY_SIMPLEX,
+                           0.8, (255, 255, 255), 2)
+
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
+
+
 def tombol_lanjut_scan_buah():
     """Bagian UI setelah hasil pembacaan: ajakan lanjut ke tahap scan buah sawit."""
     st.divider()
@@ -725,11 +792,111 @@ def tombol_lanjut_scan_buah():
 # ============================================================
 def render_menu_scan_qr():
     st.subheader("📱 Scan QR Code — Barcode TPH")
-    st.caption("Arahkan kamera ke stiker QR Code hasil cetak barcode TPH, "
-               "atau upload fotonya.")
 
     suara_aktif_qr = st.toggle("🔊 Bacakan hasil lewat suara", value=True, key="suara_qr")
 
+    if _WEBRTC_TERSEDIA:
+        _render_scan_qr_live(suara_aktif_qr)
+    else:
+        st.warning("Live-scan (kamera menyala terus tanpa perlu tekan tombol foto) "
+                   "butuh library `streamlit-webrtc` dan `av`. Tambahkan keduanya ke "
+                   "`requirements.txt` lalu redeploy untuk mengaktifkan mode ini. "
+                   "Untuk sementara, dipakai mode foto biasa:")
+        _render_scan_qr_mode_foto(suara_aktif_qr)
+
+
+def _render_scan_qr_live(suara_aktif_qr):
+    """Live scan: kamera menyala terus, QR otomatis terbaca begitu terdeteksi
+    di frame — TIDAK perlu tekan tombol ambil foto."""
+    st.caption("Arahkan kamera langsung ke stiker QR Code. Begitu QR terdeteksi, "
+               "hasil & suara langsung muncul otomatis — tidak perlu jepret foto.")
+
+    webrtc_ctx = webrtc_streamer(
+        key="scan-qr-live",
+        video_processor_factory=QRVideoProcessor,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={
+            "video": {"facingMode": "environment", "width": {"ideal": 1280}},
+            "audio": False,
+        },
+        async_processing=True,
+    )
+
+    kotak_hasil = st.empty()
+    KEY_TERAKHIR = "qr_live_teks_terakhir_dibacakan"
+
+    if webrtc_ctx.state.playing and webrtc_ctx.video_processor:
+        data_qr, teks_qr = None, None
+        # Polling singkat menunggu hasil dari thread pemroses video.
+        # Kalau dalam ~5 detik belum ketemu, halaman rerun sendiri supaya
+        # terus mengecek lagi (bukan sekali cek lalu berhenti).
+        for _ in range(15):
+            with webrtc_ctx.video_processor.lock:
+                data_qr = webrtc_ctx.video_processor.hasil_qr
+                teks_qr = webrtc_ctx.video_processor.teks_mentah
+            if data_qr or not webrtc_ctx.state.playing:
+                break
+            time.sleep(0.3)
+
+        if data_qr and st.session_state.get(KEY_TERAKHIR) != teks_qr:
+            # QR baru (belum pernah dibacakan) -> tampilkan & bacakan sekali
+            st.session_state[KEY_TERAKHIR] = teks_qr
+            with kotak_hasil.container():
+                st.success("📡 QR Code terbaca otomatis!")
+                st.markdown(f"""
+                <div class="hasil-card hasil-blok">
+                    <div class="hasil-label">Nomor Blok</div>
+                    <div class="hasil-nilai">{data_qr['blok']}</div>
+                </div>
+                <div class="hasil-card hasil-tph">
+                    <div class="hasil-label">Nomor TPH</div>
+                    <div class="hasil-nilai">{data_qr['tph']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                st.caption(f"Afdeling (AFD): **{data_qr['afdeling']}**")
+
+                if suara_aktif_qr:
+                    kalimat = (
+                        f"Terdeteksi lewat kode Q R. Afdeling {eja(data_qr['afdeling'])}. "
+                        f"Nomor Blok, {eja(data_qr['blok'])}. "
+                        f"Nomor T P H, {eja(data_qr['tph'])}. " + KALIMAT_LANJUT_BUAH
+                    )
+                    try:
+                        st.audio(buat_audio(kalimat), format="audio/mp3", autoplay=True)
+                    except Exception:
+                        st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+
+                tombol_lanjut_scan_buah()
+                if st.button("🔄 Scan QR Berikutnya", use_container_width=True):
+                    st.session_state.pop(KEY_TERAKHIR, None)
+                    st.rerun()
+        elif data_qr and st.session_state.get(KEY_TERAKHIR) == teks_qr:
+            # QR yang sama masih di depan kamera — hasil tetap ditampilkan,
+            # tapi suara TIDAK diulang-ulang
+            with kotak_hasil.container():
+                st.success("📡 QR Code terbaca (sudah dibacakan sebelumnya)")
+                st.markdown(f"""
+                <div class="hasil-card hasil-blok">
+                    <div class="hasil-label">Nomor Blok</div>
+                    <div class="hasil-nilai">{data_qr['blok']}</div>
+                </div>
+                <div class="hasil-card hasil-tph">
+                    <div class="hasil-label">Nomor TPH</div>
+                    <div class="hasil-nilai">{data_qr['tph']}</div>
+                </div>
+                """, unsafe_allow_html=True)
+                tombol_lanjut_scan_buah()
+                if st.button("🔄 Scan QR Berikutnya", use_container_width=True):
+                    st.session_state.pop(KEY_TERAKHIR, None)
+                    st.rerun()
+        else:
+            kotak_hasil.info("🔎 Mencari QR Code... arahkan kamera lebih dekat/jelas.")
+            st.rerun()
+
+
+def _render_scan_qr_mode_foto(suara_aktif_qr):
+    """Fallback lama: kamera snapshot (tekan tombol foto) + upload gambar.
+    Dipakai otomatis kalau streamlit-webrtc belum ter-install."""
     tab_kamera_qr, tab_upload_qr = st.tabs(["📷 Kamera", "🖼️ Upload"])
     img_file_qr = None
     with tab_kamera_qr:
