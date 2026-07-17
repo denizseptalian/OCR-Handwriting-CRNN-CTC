@@ -13,6 +13,7 @@
 # ============================================================
 import io
 import os
+import re
 
 import cv2
 import numpy as np
@@ -38,6 +39,11 @@ _KANDIDAT_MODEL = ["char_cnn_fp16.tflite", "char_cnn_fp32.tflite", "char_cnn_int
 MODEL_PATH = next((m for m in _KANDIDAT_MODEL if os.path.exists(m)), _KANDIDAT_MODEL[0])
 LABELS_PATH = "labels.txt"
 IMG_SIZE = 32
+
+# Isi dengan URL aplikasi "Ripeness Detector" (scan buah sawit) Anda yang sudah
+# online, agar tombol "Lanjut Scan Buah Sawit" bisa langsung membukanya.
+# Kosongkan ("") kalau belum ada / belum mau dipakai dulu.
+URL_APP_SCAN_BUAH = ""
 
 st.set_page_config(
     page_title="Pembaca Patok",
@@ -159,6 +165,42 @@ DIGIT_IDX = list(range(10))
 LETTER_IDX = list(range(10, len(CLASSES)))
 
 _clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_qr_detector = cv2.QRCodeDetector()
+
+# Pola payload QR sesuai format generator: "AFD {Afdeling} - BLOK {Blok} - TPH {Nomor}"
+_POLA_QR = re.compile(r"AFD\s*([^\-]+?)\s*-\s*BLOK\s*([^\-]+?)\s*-\s*TPH\s*(.+)", re.IGNORECASE)
+
+
+def baca_qr(bgr):
+    """Coba deteksi & decode QR Code pada gambar (mendukung >1 QR sekaligus).
+    Return teks payload QR pertama yang berhasil dibaca, atau None kalau
+    tidak ada QR Code yang terdeteksi sama sekali."""
+    try:
+        retval, decoded_info, _, _ = _qr_detector.detectAndDecodeMulti(bgr)
+        if retval:
+            for teks in decoded_info:
+                if teks:
+                    return teks
+    except Exception:
+        pass
+    # Fallback: deteksi single QR (kadang lebih andal utk 1 QR yang jelas)
+    try:
+        data, _, _ = _qr_detector.detectAndDecode(bgr)
+        return data or None
+    except Exception:
+        return None
+
+
+def urai_payload_qr(teks):
+    """Urai payload QR menjadi dict {afdeling, blok, tph}, atau None kalau
+    formatnya tidak cocok dengan pola generator barcode TPH."""
+    if not teks:
+        return None
+    m = _POLA_QR.search(teks)
+    if not m:
+        return None
+    afdeling, blok, tph = (g.strip() for g in m.groups())
+    return {"afdeling": afdeling, "blok": blok, "tph": tph}
 
 
 def binarize_full(gray, block_size=41, c_thresh=15):
@@ -657,13 +699,39 @@ def buat_audio(kalimat: str) -> bytes:
     return buf.getvalue()
 
 
+# Kalimat lanjutan yang disambungkan di akhir setiap pembacaan suara, supaya
+# alur kerja lapangan lanjut otomatis: baca patok/QR -> lalu scan buah sawit.
+KALIMAT_LANJUT_BUAH = ("Silakan lanjutkan, arahkan kamera ke buah sawit "
+                       "untuk pemindaian berikutnya.")
+
+
+def tombol_lanjut_scan_buah():
+    """Bagian UI setelah hasil pembacaan: ajakan lanjut ke tahap scan buah sawit."""
+    st.divider()
+    st.subheader("➡️ Lanjut ke Pemindaian Buah Sawit")
+    if URL_APP_SCAN_BUAH:
+        st.link_button("🍇 Buka Aplikasi Scan Buah Sawit", URL_APP_SCAN_BUAH,
+                       use_container_width=True)
+    else:
+        st.info("Tombol ini belum terhubung ke aplikasi scan buah sawit. Isi "
+                "variabel `URL_APP_SCAN_BUAH` di bagian atas kode dengan alamat "
+                "aplikasi Ripeness Detector Anda yang sudah online, atau kirim "
+                "kode aplikasi tersebut supaya digabungkan langsung ke sini.")
+
+
 # ============================================================
 # UI — mobile-first
 # ============================================================
-st.title("🌴 Pembaca Patok Blok / TPH")
+st.title("🌴 Pembaca Patok / QR Code — Blok / TPH")
 
 # Pengaturan disembunyikan dalam expander (hemat layar HP)
 with st.expander("⚙️ Pengaturan"):
+    baca_qr_dulu = st.toggle("📡 Coba baca QR Code dulu (kalau ada stiker barcode)",
+                             value=True,
+                             help="Kalau foto mengandung QR Code hasil generator "
+                                  "barcode TPH, hasilnya langsung dipakai (lebih "
+                                  "cepat & akurat). Kalau tidak ada QR, otomatis "
+                                  "lanjut ke pembacaan karakter Blok/TPH seperti biasa.")
     mode_lens = st.toggle("🔍 Mode pilih area (ala Google Lens)", value=False,
                           help="Deteksi semua area teks di foto, lalu pilih sendiri "
                                "area mana yang dibaca sebagai Blok/TPH. "
@@ -703,6 +771,9 @@ if img_file is None:
 # Decode gambar
 pil_img = Image.open(img_file).convert("RGB")
 bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+# Simpan versi UTUH (sebelum crop apa pun) khusus untuk pencarian QR Code —
+# QR bisa saja berada di luar kotak panduan patok/crop 4:5.
+bgr_untuk_qr = bgr.copy()
 
 # Foto dari kamera: crop tengah 4:5 (samakan dengan preview),
 # lalu crop lagi ke KOTAK PANDUAN putus-putus — hanya area itu yang diproses.
@@ -724,6 +795,50 @@ if dari_kamera:
         Hf, Wf = bgr.shape[:2]
         bgr = bgr[int(0.08 * Hf):int((1 - 0.22) * Hf),
                   int(0.12 * Wf):int((1 - 0.12) * Wf)]
+
+# ============================================================
+# COBA BACA QR CODE DULU (stiker barcode hasil generator TPH) —
+# kalau ketemu & formatnya cocok, langsung pakai hasil ini (lebih
+# cepat & akurat dibanding OCR karakter), lalu lanjut ke tahap buah sawit.
+# ============================================================
+if baca_qr_dulu:
+    with st.spinner("Memeriksa QR Code..."):
+        teks_qr = baca_qr(bgr_untuk_qr)
+        data_qr = urai_payload_qr(teks_qr)
+
+    if data_qr:
+        st.success("📡 QR Code terbaca!")
+        st.markdown(f"""
+        <div class="hasil-card hasil-blok">
+            <div class="hasil-label">Nomor Blok</div>
+            <div class="hasil-nilai">{data_qr['blok']}</div>
+        </div>
+        <div class="hasil-card hasil-tph">
+            <div class="hasil-label">Nomor TPH</div>
+            <div class="hasil-nilai">{data_qr['tph']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(f"Afdeling (AFD): **{data_qr['afdeling']}**")
+
+        if suara_aktif:
+            kalimat = (
+                f"Terdeteksi lewat kode Q R. Afdeling {eja(data_qr['afdeling'])}. "
+                f"Nomor Blok, {eja(data_qr['blok'])}. "
+                f"Nomor T P H, {eja(data_qr['tph'])}. " + KALIMAT_LANJUT_BUAH
+            )
+            try:
+                st.audio(buat_audio(kalimat), format="audio/mp3", autoplay=True)
+            except Exception:
+                st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+        elif teks_qr:
+            st.caption(f"Payload mentah: `{teks_qr}`")
+
+        tombol_lanjut_scan_buah()
+        st.stop()
+    elif teks_qr:
+        # Ada QR terbaca tapi formatnya tidak cocok pola "AFD-BLOK-TPH"
+        st.warning(f"QR Code terbaca tapi formatnya tidak dikenali: `{teks_qr}`. "
+                   "Melanjutkan ke pembacaan karakter Blok/TPH...")
 
 # ============================================================
 # MODE LENS: deteksi semua area teks -> sorot -> pengguna memilih
@@ -805,10 +920,13 @@ if mode_lens:
             if nomor_tph:
                 bagian.append(f"Nomor T P H, {eja(nomor_tph)}")
             try:
-                audio_bytes = buat_audio("Terdeteksi. " + ". ".join(bagian))
+                kalimat = "Terdeteksi. " + ". ".join(bagian) + ". " + KALIMAT_LANJUT_BUAH
+                audio_bytes = buat_audio(kalimat)
                 st.audio(audio_bytes, format="audio/mp3", autoplay=True)
             except Exception:
                 st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+
+        tombol_lanjut_scan_buah()
 
         with st.expander("📊 Detail confidence per karakter"):
             for ch, cf, top3 in blok_preds:
@@ -855,12 +973,14 @@ if terdeteksi:
             bagian.append(f"Nomor Blok, {eja(hasil['nomor_blok'])}")
         if hasil["nomor_tph"]:
             bagian.append(f"Nomor T P H, {eja(hasil['nomor_tph'])}")
-        kalimat = "Terdeteksi. " + ". ".join(bagian)
+        kalimat = "Terdeteksi. " + ". ".join(bagian) + ". " + KALIMAT_LANJUT_BUAH
         try:
             audio_bytes = buat_audio(kalimat)
             st.audio(audio_bytes, format="audio/mp3", autoplay=True)
         except Exception:
             st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+
+    tombol_lanjut_scan_buah()
 else:
     st.error("Tidak ada karakter terdeteksi. Coba foto ulang lebih dekat, "
              "atau sesuaikan parameter di ⚙️ Pengaturan.")
