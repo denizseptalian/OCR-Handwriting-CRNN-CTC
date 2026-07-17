@@ -720,18 +720,98 @@ def tombol_lanjut_scan_buah():
 
 
 # ============================================================
+# MENU BARU — Scan QR Code (TERPISAH dari kamera model OCR di atas;
+# tidak menyentuh CharCNN sama sekali, hanya decode QR + suara)
+# ============================================================
+def render_menu_scan_qr():
+    st.subheader("📱 Scan QR Code — Barcode TPH")
+    st.caption("Arahkan kamera ke stiker QR Code hasil cetak barcode TPH, "
+               "atau upload fotonya.")
+
+    suara_aktif_qr = st.toggle("🔊 Bacakan hasil lewat suara", value=True, key="suara_qr")
+
+    tab_kamera_qr, tab_upload_qr = st.tabs(["📷 Kamera", "🖼️ Upload"])
+    img_file_qr = None
+    with tab_kamera_qr:
+        foto_qr = st.camera_input("Arahkan ke QR Code, lalu ambil foto",
+                                  label_visibility="collapsed", key="kamera_qr")
+        if foto_qr is not None:
+            img_file_qr = foto_qr
+    with tab_upload_qr:
+        up_qr = st.file_uploader("Pilih foto QR Code", type=["png", "jpg", "jpeg", "bmp"],
+                                 label_visibility="collapsed", key="upload_qr")
+        if up_qr is not None:
+            img_file_qr = up_qr
+
+    if img_file_qr is None:
+        st.info("📷 Ambil foto QR Code atau upload gambar untuk memulai.")
+        return
+
+    pil_img_qr = Image.open(img_file_qr).convert("RGB")
+    bgr_qr = cv2.cvtColor(np.array(pil_img_qr), cv2.COLOR_RGB2BGR)
+
+    with st.spinner("Membaca QR Code..."):
+        teks_qr = baca_qr(bgr_qr)
+        data_qr = urai_payload_qr(teks_qr)
+
+    if data_qr:
+        st.success("📡 QR Code terbaca!")
+        st.markdown(f"""
+        <div class="hasil-card hasil-blok">
+            <div class="hasil-label">Nomor Blok</div>
+            <div class="hasil-nilai">{data_qr['blok']}</div>
+        </div>
+        <div class="hasil-card hasil-tph">
+            <div class="hasil-label">Nomor TPH</div>
+            <div class="hasil-nilai">{data_qr['tph']}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        st.caption(f"Afdeling (AFD): **{data_qr['afdeling']}**")
+
+        if suara_aktif_qr:
+            kalimat = (
+                f"Terdeteksi lewat kode Q R. Afdeling {eja(data_qr['afdeling'])}. "
+                f"Nomor Blok, {eja(data_qr['blok'])}. "
+                f"Nomor T P H, {eja(data_qr['tph'])}. " + KALIMAT_LANJUT_BUAH
+            )
+            try:
+                st.audio(buat_audio(kalimat), format="audio/mp3", autoplay=True)
+            except Exception:
+                st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
+
+        tombol_lanjut_scan_buah()
+    elif teks_qr:
+        st.warning(f"QR Code terbaca, tapi formatnya tidak dikenali: `{teks_qr}`. "
+                   "Pastikan ini QR Code hasil generator barcode TPH.")
+    else:
+        st.error("Tidak ada QR Code terdeteksi pada foto. Pastikan QR Code terlihat "
+                 "jelas, tidak blur, dan cukup dekat/terang.")
+
+
+# ============================================================
 # UI — mobile-first
 # ============================================================
 st.title("🌴 Pembaca Patok / QR Code — Blok / TPH")
 
+menu_utama = st.radio(
+    "Pilih Menu",
+    ["🌴 Baca Patok (OCR Karakter)", "📱 Scan QR Code"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+st.divider()
+
+if menu_utama == "📱 Scan QR Code":
+    render_menu_scan_qr()
+    st.stop()
+
+# ------------------------------------------------------------
+# Kalau sampai di sini berarti menu_utama == "Baca Patok (OCR Karakter)"
+# — SELURUH kode di bawah ini TIDAK BERUBAH dari versi sebelumnya.
+# ------------------------------------------------------------
+
 # Pengaturan disembunyikan dalam expander (hemat layar HP)
 with st.expander("⚙️ Pengaturan"):
-    baca_qr_dulu = st.toggle("📡 Coba baca QR Code dulu (kalau ada stiker barcode)",
-                             value=True,
-                             help="Kalau foto mengandung QR Code hasil generator "
-                                  "barcode TPH, hasilnya langsung dipakai (lebih "
-                                  "cepat & akurat). Kalau tidak ada QR, otomatis "
-                                  "lanjut ke pembacaan karakter Blok/TPH seperti biasa.")
     mode_lens = st.toggle("🔍 Mode pilih area (ala Google Lens)", value=False,
                           help="Deteksi semua area teks di foto, lalu pilih sendiri "
                                "area mana yang dibaca sebagai Blok/TPH. "
@@ -771,9 +851,6 @@ if img_file is None:
 # Decode gambar
 pil_img = Image.open(img_file).convert("RGB")
 bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-# Simpan versi UTUH (sebelum crop apa pun) khusus untuk pencarian QR Code —
-# QR bisa saja berada di luar kotak panduan patok/crop 4:5.
-bgr_untuk_qr = bgr.copy()
 
 # Foto dari kamera: crop tengah 4:5 (samakan dengan preview),
 # lalu crop lagi ke KOTAK PANDUAN putus-putus — hanya area itu yang diproses.
@@ -795,50 +872,6 @@ if dari_kamera:
         Hf, Wf = bgr.shape[:2]
         bgr = bgr[int(0.08 * Hf):int((1 - 0.22) * Hf),
                   int(0.12 * Wf):int((1 - 0.12) * Wf)]
-
-# ============================================================
-# COBA BACA QR CODE DULU (stiker barcode hasil generator TPH) —
-# kalau ketemu & formatnya cocok, langsung pakai hasil ini (lebih
-# cepat & akurat dibanding OCR karakter), lalu lanjut ke tahap buah sawit.
-# ============================================================
-if baca_qr_dulu:
-    with st.spinner("Memeriksa QR Code..."):
-        teks_qr = baca_qr(bgr_untuk_qr)
-        data_qr = urai_payload_qr(teks_qr)
-
-    if data_qr:
-        st.success("📡 QR Code terbaca!")
-        st.markdown(f"""
-        <div class="hasil-card hasil-blok">
-            <div class="hasil-label">Nomor Blok</div>
-            <div class="hasil-nilai">{data_qr['blok']}</div>
-        </div>
-        <div class="hasil-card hasil-tph">
-            <div class="hasil-label">Nomor TPH</div>
-            <div class="hasil-nilai">{data_qr['tph']}</div>
-        </div>
-        """, unsafe_allow_html=True)
-        st.caption(f"Afdeling (AFD): **{data_qr['afdeling']}**")
-
-        if suara_aktif:
-            kalimat = (
-                f"Terdeteksi lewat kode Q R. Afdeling {eja(data_qr['afdeling'])}. "
-                f"Nomor Blok, {eja(data_qr['blok'])}. "
-                f"Nomor T P H, {eja(data_qr['tph'])}. " + KALIMAT_LANJUT_BUAH
-            )
-            try:
-                st.audio(buat_audio(kalimat), format="audio/mp3", autoplay=True)
-            except Exception:
-                st.caption("🔇 Suara gagal dibuat (cek koneksi internet).")
-        elif teks_qr:
-            st.caption(f"Payload mentah: `{teks_qr}`")
-
-        tombol_lanjut_scan_buah()
-        st.stop()
-    elif teks_qr:
-        # Ada QR terbaca tapi formatnya tidak cocok pola "AFD-BLOK-TPH"
-        st.warning(f"QR Code terbaca tapi formatnya tidak dikenali: `{teks_qr}`. "
-                   "Melanjutkan ke pembacaan karakter Blok/TPH...")
 
 # ============================================================
 # MODE LENS: deteksi semua area teks -> sorot -> pengguna memilih
